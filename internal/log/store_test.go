@@ -84,7 +84,7 @@ func TestStoreClose(t *testing.T) {
 	err = s.Close()
 	require.NoError(t, err)
 
-	_, afterSize, err := opneFile(f.Name())
+	_, afterSize, err := openFile(f.Name())
 	require.NoError(t, err)
 	require.True(t, afterSize > beforeSize)
 }
@@ -95,4 +95,12 @@ func openFile(name string) (file *os.File, size int64, err error) {
 		os.O_RDWR|os.O_CREATE|os.O_APPEND,
 		0644,
 	)
+	if err != nil {
+		return nil, 0, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	return f, fi.Size(), nil
 }
