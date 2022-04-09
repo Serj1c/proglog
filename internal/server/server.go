@@ -3,12 +3,30 @@ package server
 import (
 	"context"
 
-	api "github.com/serj1c/proglog/api/v1"
+	grpcmiddleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpcauth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
+
+	api "github.com/serj1c/proglog/api/v1"
 )
 
 type Config struct {
-	CommitLog CommitLog
+	CommitLog  CommitLog
+	Authorizer Authorizer
+}
+
+const (
+	objectWildcard = "*"
+	produceAction  = "produce"
+	consumeAction  = "consume"
+)
+
+type Authorizer interface {
+	Authorize(subject, object, action string) error
 }
 
 type CommitLog interface {
@@ -24,12 +42,21 @@ type grpcServer struct {
 }
 
 func NewGRPCServer(config *Config, opts ...grpc.ServerOption) (*grpc.Server, error) {
+	opts = append(opts, grpc.StreamInterceptor(
+		grpcmiddleware.ChainStreamServer(
+			grpcauth.StreamServerInterceptor(authenticate),
+		)), grpc.UnaryInterceptor(grpcmiddleware.ChainUnaryServer(
+		grpcauth.UnaryServerInterceptor(authenticate),
+	)))
+
 	gsrv := grpc.NewServer(opts...)
 	srv, err := newGrpcServer(config)
 	if err != nil {
 		return nil, err
 	}
+
 	api.RegisterLogServer(gsrv, srv)
+
 	return gsrv, nil
 }
 
@@ -41,18 +68,36 @@ func newGrpcServer(config *Config) (*grpcServer, error) {
 }
 
 func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (*api.ProduceResponse, error) {
+	if err := s.Authorizer.Authorize(
+		subject(ctx),
+		objectWildcard,
+		produceAction,
+	); err != nil {
+		return nil, err
+	}
+
 	offset, err := s.CommitLog.Append(req.Record)
 	if err != nil {
 		return nil, err
 	}
+
 	return &api.ProduceResponse{Offset: offset}, nil
 }
 
 func (s *grpcServer) Consume(ctx context.Context, req *api.ConsumeRequest) (*api.ConsumeResponse, error) {
+	if err := s.Authorizer.Authorize(
+		subject(ctx),
+		objectWildcard,
+		consumeAction,
+	); err != nil {
+		return nil, err
+	}
+
 	record, err := s.CommitLog.Read(req.Offset)
 	if err != nil {
 		return nil, err
 	}
+
 	return &api.ConsumeResponse{Record: record}, nil
 }
 
@@ -92,4 +137,30 @@ func (s *grpcServer) ConsumeStream(req *api.ConsumeRequest, stream api.Log_Consu
 			req.Offset++
 		}
 	}
+}
+
+type subjectContextKey struct{}
+
+func authenticate(ctx context.Context) (context.Context, error) {
+	peer, ok := peer.FromContext(ctx)
+	if !ok {
+		return ctx, status.New(
+			codes.Unknown,
+			"could not find peer info",
+		).Err()
+	}
+
+	if peer.AuthInfo == nil {
+		return context.WithValue(ctx, subjectContextKey{}, ""), nil
+	}
+
+	tlsInfo := peer.AuthInfo.(credentials.TLSInfo)
+	subject := tlsInfo.State.VerifiedChains[0][9].Subject.CommonName
+	ctx = context.WithValue(ctx, subjectContextKey{}, subject)
+
+	return ctx, nil
+}
+
+func subject(ctx context.Context) string {
+	return ctx.Value(subjectContextKey{}).(string)
 }
